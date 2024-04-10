@@ -1,0 +1,99 @@
+name: build_mi10_series_hyperos_OneDrivePush
+on:
+  workflow_dispatch:
+    inputs:
+      STOCK_URL:
+        description: "待操作的底包/xiaomi.eu底包下载地址 | BASEROM DIRECT DOWNLOAD LINK(XIAOMI.EU or CN OFFICIAL ROM)"
+        required: true
+      PORT_URL:
+        description: "待操作的移植包下载地址 | PORTROM DIRECT DOWNLOAD LINK(XIAOMI.EU OR CN OFFICIAL ROM)"
+        required: true
+      PACK_TYPE:
+        description: "打包类型（EXT/EROFS) | PACKING TYPE(EXT/EROFS), EROFS BY DEFAULT"
+        default: EROFS
+        required: false
+      ENCRYPTION:
+        description: "是否解密data分区(TRUE/FALSE)，默认加密 | FBE DECRYPTION OR NOT, FBE ENABLED BY DEFAULT"
+        default: FALSE
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 精简无用组件 | DEBLOAT COMPONENTS
+        run: |
+          docker rmi `docker images -q` || true
+          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/sudo apt/sources.list.d || true
+          sudo apt -y purge azure-cli ghc* zulu* hhvm llvm* firefox google* dotnet* powershell openjdk* mysql* php* || true
+          sudo apt -y autoremove --purge || true
+          sudo apt -y autoclean || true
+          sudo apt clean || true
+      - name: 2. 最大化并挂载构建空间 | MAXIMIZE BUILD SPACE
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 1024
+          swap-size-mb: 6144
+          remove-dotnet: "true"
+          temp-reserve-mb: 1024
+          remove-android: "true"
+          remove-haskell: "true"
+      - name: 3. 检出仓库文件 | CHECKOUT REPOSITORY
+        uses: actions/checkout@main
+        with:
+          ref: dev
+          fetch-depth: 1
+      - name: 4. 准备环境 | PREPARE ENVIRONMENT
+        run: |
+          sudo apt install python3 python3-pip aria2 zip p7zip-full tar zipalign zstd android-sdk-libsparse-utils xmlstarlet coreutils
+          sudo apt --fix-broken install
+          sudo apt update --fix-missing
+          pip3 install --upgrade pip
+          curl https://rclone.org/install.sh | sudo bash
+          mkdir -p ~/.config/rclone/
+          echo "${{ secrets.RCLONE_TOKEN }}" > token.txt
+          base64 -d token.txt > ~/.config/rclone/rclone.conf
+      - name: 5. 开始移植 | START PORTING
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          mkdir tmp
+          rclone sync -P onedrive:/ROM_FILES/ tmp/
+          zipfiles=$(find tmp -name "*.zip")
+          for file in $zipfiles; do
+            echo "Unzipping $file to devices folder" 
+            unzip -o $file -d devices
+          done
+          if [[ ${{ github.event.inputs.PACK_TYPE }} == "EROFS" ]]; then
+              sed -i "s/repack_with_ext4=true/repack_with_ext4=false/" bin/port_config
+          fi
+
+          if [[ ${{ github.event.inputs.ENCRYPTION }} == "TRUE" ]]; then
+              sed -i "s/remove_data_encryption=false/remove_data_encryption=true/" bin/port_config
+          fi
+          sudo bash "$GITHUB_WORKSPACE"/port.sh ${{ github.event.inputs.STOCK_URL }} ${{ github.event.inputs.PORT_URL }} 
+      - name: 6. 准备上传 | PREPARE UPLOADING
+        run: |
+          ROM_FILE=$(basename $(find "$GITHUB_WORKSPACE"/out -name "*.zip"))
+          echo "ROM_FILE=$ROM_FILE" >>$GITHUB_ENV
+          OS_VERSION=$(echo $ROM_FILE | cut -d "_" -f3)
+          echo "OS_VERSION=$OS_VERSION" >>$GITHUB_ENV
+          mkdir -p "$GITHUB_WORKSPACE"/GithubRelease
+          cd "$GITHUB_WORKSPACE"/GithubRelease
+          sudo split -b 1536M -d "$GITHUB_WORKSPACE"/out/$ROM_FILE $ROM_FILE
+          ls -al "$GITHUB_WORKSPACE"/GithubRelease/
+      - name: 7.上传到OneDrive | PUSH ROM TO ONEDRIVE
+        run: |
+            rclone sync -P "$GITHUB_WORKSPACE"/out/${{ env.ROM_FILE }} onedrive:/ROM/github-actions
+            SHARE_LINK=$(rclone link onedrive:/ROM/github-actions/ --onedrive-link-scope anonymous)
+            touch file.log
+            echo -e "Onedrive下载链接 | Onedrive alternate download link: \n $SHARE_LINK" > file.log
+     
+      - name: 8. 上传到Github Release| UPLOAD ROM TO GITHUB RELEASAE
+        uses: ncipollo/release-action@main
+        with:
+          artifacts: ${{ github.workspace }}/GithubRelease/*
+          name: ${{ env.OS_VERSION }}
+          tag: ${{ env.OS_VERSION }}
+          bodyFile: "${{ github.workspace }}/file.log"
+          allowUpdates: true
+          artifactErrorsFailBuild: true
